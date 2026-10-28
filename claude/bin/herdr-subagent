@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Run Claude subagents as Herdr agents in a per-session "ccsub" tab.
+
+Herdr is the only record. Every subagent pane carries metadata tokens:
+  role=ccsub owner=<owner session id> owner_pane=<pane id> seq=<n>
+  session=<subagent session id> collected=0|1
+Tokens live on the pane (they outlive the agent) and any process can write
+them, so a pane is a verified subagent only if ALL hold:
+  - agent name matches ccsub-<owner[:8]>-<seq>
+  - tokens.role == ccsub
+  - tokens.session == the session id Herdr reports for the pane
+  - the pane's tab is labelled ccsub-<owner[:8]>
+Tokens are rewritten on every agent start, so a recycled pane never inherits
+the previous occupant's state.
+
+Owner = the Claude session id of the calling pane.
+Policy:
+  - one tab per owner, created on first spawn in the caller's workspace
+  - up to MAX_SLOTS panes per tab, grid built by splitting the largest pane
+  - when full, recycle the owner's oldest collected idle/done slot
+  - done agents stay open until recycled or cleared
+
+Usage:
+  herdr-subagent spawn "<brief>"              -> prints agent name
+  herdr-subagent collect <name> [--timeout MS] [--lines N]
+  herdr-subagent status [mine]
+  herdr-subagent clear [mine] [--dry-run]
+
+clear (default: every owner; `mine`: this session only) closes:
+  - verified idle/done subagents that were collected
+  - verified idle/done subagents never collected, only if their owner session is gone
+  - agent-less panes left in an in-scope ccsub tab that carry role=ccsub tokens
+It keeps working/blocked agents and anything that fails verification.
+
+Exit codes: 2 usage, 3 all slots busy/uncollected, 4 called from a subagent,
+5 collect timed out / agent not settled.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+MAX_SLOTS = int(os.environ.get("HERDR_SUBAGENT_MAX", "8"))
+READY = {"idle", "done"}
+SRC = "ccsub"
+NAME_RE = re.compile(r"^ccsub-([0-9a-f]{8})-(\d+)$")
+
+
+def die(msg, code=1):
+    print(f"herdr-subagent: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def herdr(*args, check=True, raw=False):
+    p = subprocess.run(["herdr", *args], capture_output=True, text=True)
+    if p.returncode != 0:
+        if check:
+            die(f"herdr {' '.join(args)} failed: {p.stderr.strip()}")
+        return None
+    if raw:
+        return p.stdout
+    out = p.stdout.strip()
+    return json.loads(out)["result"] if out else {}
+
+
+def owner():
+    """Claude session id of the calling pane."""
+    if os.environ.get("HERDR_ENV") != "1":
+        die("not running inside Herdr")
+    if os.environ.get("HERDR_SUBAGENT") == "1":
+        die("refusing to manage subagents from inside a subagent", 4)
+    a = herdr("agent", "get", os.environ["HERDR_PANE_ID"], check=False)
+    if not a:
+        die(f"no agent detected in calling pane {os.environ['HERDR_PANE_ID']}")
+    return a["agent"]["agent_session"]["value"]
+
+
+def tab_label(own):
+    return f"ccsub-{own[:8]}"
+
+
+def set_tokens(pane, **kv):
+    args = ["pane", "report-metadata", pane, "--source", SRC]
+    for k, v in kv.items():
+        args += ["--token", f"{k}={v}"]
+    herdr(*args)
+
+
+# ---------- inventory (one pass over Herdr) ----------
+
+def inventory():
+    """Return (subagents, stray_panes, live_sessions, tabs)."""
+    tabs = {t["tab_id"]: t for t in herdr("tab", "list")["tabs"]}
+    panes = herdr("pane", "list")["panes"]
+    agents = {a["pane_id"]: a for a in herdr("agent", "list")["agents"]}
+    live = {a["agent_session"]["value"] for a in agents.values() if a.get("agent_session")}
+    subs, strays = [], []
+    for p in panes:
+        tok = p.get("tokens") or {}
+        if tok.get("role") != "ccsub":
+            continue
+        a = agents.get(p["pane_id"])
+        rec = {"pane_id": p["pane_id"], "tab_id": p["tab_id"],
+               "tab_label": tabs.get(p["tab_id"], {}).get("label"), "tokens": tok,
+               "owner": tok.get("owner", ""), "seq": int(tok.get("seq") or 0),
+               "collected": tok.get("collected") == "1"}
+        if a is None:
+            strays.append(rec)
+            continue
+        m = NAME_RE.match(a.get("name") or "")
+        session = (a.get("agent_session") or {}).get("value")
+        rec.update(name=a.get("name"), status=a["agent_status"], session=session)
+        rec["verified"] = bool(m and session and tok.get("session") == session
+                               and m.group(1) == rec["owner"][:8]
+                               and rec["tab_label"] == tab_label(rec["owner"]))
+        subs.append(rec)
+    return subs, strays, live, tabs
+
+
+def mine(subs, own):
+    return [s for s in subs if s["verified"] and s["owner"] == own]
+
+
+def owner_tab(own, subs, strays, tabs):
+    for s in subs + strays:
+        if s["owner"] == own and s["tab_label"] == tab_label(own):
+            return s["tab_id"]
+    ws = os.environ["HERDR_WORKSPACE_ID"]
+    for t in tabs.values():
+        if t["workspace_id"] == ws and t.get("label") == tab_label(own):
+            return t["tab_id"]
+    return None
+
+
+# ---------- pane lifecycle ----------
+
+def shell_at_prompt(pane_id):
+    info = herdr("pane", "process-info", "--pane", pane_id)["process_info"]
+    procs = info.get("foreground_processes") or []
+    return all(p["pid"] == info["shell_pid"] for p in procs)
+
+
+def wait_shell(pane_id, timeout=30):
+    end = time.time() + timeout
+    while time.time() < end:
+        if shell_at_prompt(pane_id):
+            return
+        time.sleep(0.5)
+    die(f"pane {pane_id} shell not back at prompt after {timeout}s")
+
+
+def start_agent(name, pane, timeout=60):
+    # A fresh shell can look foreground before zsh finishes its rc files; retry while busy.
+    end = time.time() + timeout
+    while True:
+        p = subprocess.run(["herdr", "agent", "start", name, "--kind", "claude", "--pane", pane,
+                            "--timeout", "60000"], capture_output=True, text=True)
+        if p.returncode == 0:
+            return json.loads(p.stdout)["result"]["agent"]
+        if "agent_pane_busy" not in p.stderr or time.time() > end:
+            die(f"agent start {name} in {pane} failed: {p.stderr.strip()}")
+        time.sleep(1)
+
+
+def new_pane(own, tab_id, cwd):
+    env = "HERDR_SUBAGENT=1"
+    if not tab_id:
+        r = herdr("tab", "create", "--workspace", os.environ["HERDR_WORKSPACE_ID"],
+                  "--cwd", cwd, "--label", tab_label(own), "--env", env, "--no-focus")
+        pane = r["root_pane"]["pane_id"]
+    else:
+        # Split the largest pane; cells are ~2:1 tall, so compare width to 2*height.
+        any_pane = next(p["pane_id"] for p in herdr("pane", "list")["panes"] if p["tab_id"] == tab_id)
+        layout = herdr("pane", "layout", "--pane", any_pane)["layout"]
+        big = max(layout["panes"], key=lambda p: (p["rect"]["width"] * p["rect"]["height"], p["pane_id"]))
+        w, h = big["rect"]["width"], big["rect"]["height"]
+        direction = "right" if w >= 2 * h else "down"
+        pane = herdr("pane", "split", "--pane", big["pane_id"], "--direction", direction,
+                     "--cwd", cwd, "--env", env, "--no-focus")["pane"]["pane_id"]
+    # Mark immediately so a failed spawn leaves a recognisable stray, not an anonymous shell.
+    set_tokens(pane, role="ccsub", owner=own, owner_pane=os.environ["HERDR_PANE_ID"],
+               seq=0, session="none", collected=0)
+    return pane
+
+
+def recycle(own, slots):
+    for s in sorted(slots, key=lambda s: s["seq"]):
+        if s["collected"] and s["status"] in READY:
+            # Invalidate before exiting so the pane never looks like a collected live slot.
+            set_tokens(s["pane_id"], session="none", collected=0)
+            herdr("agent", "prompt", s["name"], "/exit")
+            wait_shell(s["pane_id"])
+            print(f"recycled {s['name']} (resume: claude --resume {s['session']})", file=sys.stderr)
+            return s["pane_id"]
+    busy = ", ".join(f"{s['name']}={s['status']}{'' if s['collected'] else '/uncollected'}"
+                     for s in sorted(slots, key=lambda s: s["seq"]))
+    die(f"all {MAX_SLOTS} slots busy or uncollected: {busy}", 3)
+
+
+# ---------- commands ----------
+
+def spawn(brief):
+    own = owner()
+    subs, strays, _, tabs = inventory()
+    slots = mine(subs, own)
+    tab_id = owner_tab(own, subs, strays, tabs)
+    spare = sorted(s["pane_id"] for s in strays if s["owner"] == own and s["tab_id"] == tab_id)
+    if spare:
+        pane = spare[0]
+    elif len(slots) < MAX_SLOTS:
+        pane = new_pane(own, tab_id, os.getcwd())
+    else:
+        pane = recycle(own, slots)
+    seq = 1 + max([s["seq"] for s in subs + strays if s["owner"] == own] or [0])
+    name = f"ccsub-{own[:8]}-{seq:02d}"
+    a = start_agent(name, pane)
+    herdr("pane", "rename", pane, name)
+    set_tokens(pane, role="ccsub", owner=own, owner_pane=os.environ["HERDR_PANE_ID"],
+               seq=seq, session=a["agent_session"]["value"], collected=0)
+    herdr("agent", "prompt", name, brief)
+    print(name)
+
+
+def collect(name, timeout="600000", lines="200"):
+    own = owner()
+    slot = next((s for s in mine(inventory()[0], own) if s["name"] == name), None)
+    if not slot:
+        die(f"{name} is not a verified subagent of this session")
+    w = herdr("agent", "wait", name, "--timeout", timeout, check=False)
+    status = (herdr("agent", "get", name, check=False) or {}).get("agent", {}).get("agent_status")
+    print(herdr("agent", "read", name, "--source", "recent-unwrapped", "--lines", lines, raw=True))
+    if w is not None and status in READY:
+        set_tokens(slot["pane_id"], collected=1)
+    else:
+        die(f"{name} not settled (status={status}); left uncollected", 5)
+
+
+def clear(only_mine=False, dry_run=False):
+    own = owner()
+    subs, strays, live, _ = inventory()
+    in_scope = (lambda o: o == own) if only_mine else (lambda o: True)
+    close, keep = [], []
+    for s in sorted(subs, key=lambda s: (s["owner"], s["seq"])):
+        if not in_scope(s["owner"]):
+            continue
+        label = s.get("name") or s["pane_id"]
+        if not s["verified"]:
+            keep.append((label, s["pane_id"], "failed verification"))
+        elif s["status"] not in READY:
+            keep.append((label, s["pane_id"], s["status"]))
+        elif s["collected"]:
+            close.append((label, s["pane_id"], f"collected; resume: claude --resume {s['session']}"))
+        elif s["owner"] not in live:
+            close.append((label, s["pane_id"], f"uncollected, owner gone; resume: claude --resume {s['session']}"))
+        else:
+            keep.append((label, s["pane_id"], f"{s['status']}/uncollected, owner alive"))
+    for s in strays:
+        if in_scope(s["owner"]) and s["tab_label"] == tab_label(s["owner"]):
+            close.append((s["pane_id"], s["pane_id"], "agent-less ccsub pane"))
+    verb = "would close" if dry_run else "closed"
+    for label, pane, why in close:
+        if not dry_run:
+            herdr("pane", "close", pane)
+        print(f"{verb} {label}  {pane}  ({why})")
+    for label, pane, why in keep:
+        print(f"kept   {label}  {pane}  ({why})")
+    if not close and not keep:
+        print("nothing to clear")
+
+
+def status(only_mine=False):
+    own = owner()
+    subs, strays, live, _ = inventory()
+    rows = [s for s in subs + strays if not only_mine or s["owner"] == own]
+    print(f"me={own}  subagent panes={len(rows)}")
+    for s in sorted(rows, key=lambda s: (s["owner"], s["seq"])):
+        alive = "alive" if s["owner"] in live else "gone"
+        print(f"  {s.get('name') or '(no agent)':22} {s['pane_id']:22} {s.get('status', '-'):8} "
+              f"collected={int(s['collected'])} verified={int(s.get('verified', False))} "
+              f"owner={s['owner'][:8]}({alive})")
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["spawn"] and len(a) == 2:
+        spawn(a[1])
+    elif a[:1] == ["collect"] and len(a) >= 2:
+        opts = dict(zip(a[2::2], a[3::2]))
+        collect(a[1], opts.get("--timeout", "600000"), opts.get("--lines", "200"))
+    elif a[:1] == ["status"] and a[1:] in ([], ["mine"]):
+        status(only_mine=a[1:] == ["mine"])
+    elif a[:1] == ["clear"] and set(a[1:]) <= {"mine", "--dry-run"}:
+        clear(only_mine="mine" in a[1:], dry_run="--dry-run" in a[1:])
+    else:
+        die(__doc__.strip(), 2)
