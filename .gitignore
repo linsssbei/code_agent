@@ -1,0 +1,18 @@
+# Never commit live config, secrets, or agent runtime state
+settings.json
+settings.local.json
+config.toml
+*.bak*
+*.lock
+*.sqlite*
+*.jsonl
+.env*
+*.pem
+*.key
+certs/
+history*
+sessions/
+projects/
+cache/
+.DS_Store
+__pycache__/
