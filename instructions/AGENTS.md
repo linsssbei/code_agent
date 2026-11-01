@@ -30,7 +30,7 @@ turn recurring manual checks into reusable skills, and hold a high bar for evide
 - Prefer stdlib and the smallest dependency that does the job.
 
 ## Side effects are ack-gated
-- Anything that writes outside the working tree — shared documents, external systems, external shares, sending a message, opening a PR — is **dry-run first**: show me exactly what you'll do, wait for explicit sign-off, then execute.
+- Anything that writes outside the working tree — shared documents, external systems, external shares, sending a message, opening a PR — requires explicit sign-off: show me exactly what you'll do, wait for approval, then execute. Dry runs are optional; use them when they help validate a change.
 - Look before you delete or overwrite. Destructive shell ops (`rm -rf`, `chmod -R`, …) need a reason and a confirm.
 - Approval for one action is not approval for the next.
 
